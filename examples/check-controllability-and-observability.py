@@ -29,7 +29,13 @@ sys = ss(A, B, C, 0)
 # Check controllability
 Wc = ctrb(A, B)
 print("Wc = ", Wc)
+print("rank[Wc] = {}".format(np.linalg.matrix_rank(Wc)))
 
 # Check Observability
 Wo = obsv(A, C)
 print("Wo = ", Wo)
+print("rank[Wo] = {}".format(np.linalg.matrix_rank(Wo)))
+
+Wo = obsv(A, np.eye(3))
+print("Wo = ", Wo)
+print("rank[Wo] = {}".format(np.linalg.matrix_rank(Wo)))

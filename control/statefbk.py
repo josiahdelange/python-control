@@ -1098,7 +1098,6 @@ def gram(sys, type):
     ValueError
         * if system is not instance of StateSpace class
         * if `type` is not 'c', 'o', 'cf' or 'of'
-        * if system is unstable (sys.A has eigenvalues not in left half plane)
 
     ControlSlycot
         if slycot routine sb03md cannot be found
@@ -1114,6 +1113,11 @@ def gram(sys, type):
 
     """
 
+    #
+    # [1] A NEW BALANCED REALIZATION AND MODEL REDUCTION METHOD FOR UNSTABLE SYSTEMS
+    # [2] BALANCED REALIZATION AND MODEL REDUCTION FOR UNSTABLE SYSTEMS
+    #
+
     # Check for ss system object
     if not isinstance(sys, statesp.StateSpace):
         raise ValueError("System must be StateSpace!")
@@ -1123,57 +1127,177 @@ def gram(sys, type):
     # Check if system is continuous or discrete
     if sys.isctime():
         dico = 'C'
-
-        # TODO: Check system is stable, perhaps a utility in ctrlutil.py
-        # or a method of the StateSpace class?
-        if np.any(np.linalg.eigvals(sys.A).real >= 0.0):
-            raise ValueError("Oops, the system is unstable!")
-
     else:
         assert sys.isdtime()
         dico = 'D'
 
-        if np.any(np.abs(sys.poles()) >= 1.):
-            raise ValueError("Oops, the system is unstable!")
+    # Check for marginal stability (within a tolerance)
+    tol = 1e-6 # TODO: tunable?
+    if dico == 'C':
+        if np.any(abs(np.linalg.eigvals(sys.A).real) <= tol):
+            raise ValueError("System has poles on the imaginary axis!")
+    else:
+        if np.any(np.abs(sys.poles()) <= 1.0 + tol):
+            raise ValueError("System has poles on the imaginary axis!")
 
-    if type == 'c' or type == 'o':
-        # Compute Gramian by the Slycot routine sb03md
-        # make sure Slycot is installed
-        if sb03md is None:
-            raise ControlSlycot("can't find slycot module 'sb03md'")
-        if type == 'c':
-            tra = 'T'
-            C = -sys.B @ sys.B.T
-        elif type == 'o':
+    # Count the number of stable vs. unstable modes
+    num_stable = 0
+    num_unstable = 0
+    for p in sys.poles():
+        if dico == 'C':
+            if (p.real >= tol):
+                num_unstable += 1
+        else:
+            if (abs(p) >= 1.0 + tol):
+                num_unstable += 1
+    num_stable = len(sys.poles()) - num_unstable
+
+    if num_unstable == 0:
+        # All eigenmodes are stable - solve Lyapunov equation for Gramian
+        As = sys.A
+        Bs = sys.B
+        Cs = sys.C
+
+        if type == 'c' or type == 'o':
+            # Compute Gramian by the Slycot routine sb03md
+            # make sure Slycot is installed
+            if sb03md is None:
+                raise ControlSlycot("can't find slycot module 'sb03md'")
+            if type == 'c':
+                tra = 'T'
+                C = -sys.B @ sys.B.T
+            elif type == 'o':
+                tra = 'N'
+                C = -sys.C.T @ sys.C
+            n = sys.nstates
+            U = np.zeros((n, n))
+            A = np.array(sys.A)         # convert to NumPy array for slycot
+            X, scale, sep, ferr, w = sb03md(
+                n, C, A, U, dico, job='X', fact='N', trana=tra)
+            gram = X
+            return _ssmatrix(gram)
+
+        elif type == 'cf' or type == 'of':
+            # Compute cholesky factored gramian from slycot routine sb03od
+            if sb03od is None:
+                raise ControlSlycot("can't find slycot module 'sb03od'")
             tra = 'N'
-            C = -sys.C.T @ sys.C
-        n = sys.nstates
-        U = np.zeros((n, n))
-        A = np.array(sys.A)         # convert to NumPy array for slycot
-        X, scale, sep, ferr, w = sb03md(
-            n, C, A, U, dico, job='X', fact='N', trana=tra)
-        gram = X
-        return _ssmatrix(gram)
+            n = sys.nstates
+            Q = np.zeros((n, n))
+            A = np.array(sys.A)         # convert to NumPy array for slycot
+            if type == 'cf':
+                m = sys.B.shape[1]
+                B = np.zeros_like(A)
+                B[0:m, 0:n] = sys.B.transpose()
+                X, scale, w = sb03od(
+                    n, m, A.transpose(), Q, B, dico, fact='N', trans=tra)
+            elif type == 'of':
+                m = sys.C.shape[0]
+                C = np.zeros_like(A)
+                C[0:n, 0:m] = sys.C.transpose()
+                X, scale, w = sb03od(
+                    n, m, A, Q, C.transpose(), dico, fact='N', trans=tra)
+            gram = X
+            return _ssmatrix(gram)
 
-    elif type == 'cf' or type == 'of':
-        # Compute cholesky factored gramian from slycot routine sb03od
-        if sb03od is None:
-            raise ControlSlycot("can't find slycot module 'sb03od'")
-        tra = 'N'
-        n = sys.nstates
-        Q = np.zeros((n, n))
-        A = np.array(sys.A)         # convert to NumPy array for slycot
-        if type == 'cf':
-            m = sys.B.shape[1]
-            B = np.zeros_like(A)
-            B[0:m, 0:n] = sys.B.transpose()
-            X, scale, w = sb03od(
-                n, m, A.transpose(), Q, B, dico, fact='N', trans=tra)
-        elif type == 'of':
-            m = sys.C.shape[0]
-            C = np.zeros_like(A)
-            C[0:n, 0:m] = sys.C.transpose()
-            X, scale, w = sb03od(
-                n, m, A, Q, C.transpose(), dico, fact='N', trans=tra)
-        gram = X
-        return _ssmatrix(gram)
+    else:
+        # Unstable plant: compute Gramian by decomposing plant into stable
+        # and unstable subspaces, compute decoupling matrix between them,
+        # them reconstruct Gramian after solving several Lyaponov equations
+
+        """
+        % The transformation T in Theorem 1 in Zhou (1999) can be obtained using the
+        % algorithm of Nagar and Singh (2004)
+        % Find the Schur form:
+        [U,T] = schur(A);
+
+        % Reorder the Schur factorization A = U*T*U' of  matrix A so that the 
+        % negative (i.e. stable) cluster of eigenvalues appears in the  
+        % leading (upper left) diagonal blocks of the Schur matrix T 
+        %(Nagar and Singh eqn (2))
+        [US,TS] = ordschur(U,T,'lhp');
+
+        % Solve Lyapunov equation - Nagar and Singh eqn(3)]
+        % This will enable us to decouple the system in order to separate into 
+        % stable and unstable components
+        A11     =   TS(1:Neg,1:Neg);
+        A12     =   TS(1:Neg,Neg+1:n);
+        A22     =   TS(Neg+1:n,Neg+1:n);
+        S       =   lyap(A11,-A22,A12);
+
+        % Use W and its inverse to find decoupled system - Nagar and Singh eqn(4,5)
+        W       =   [eye(Neg) S; zeros(n-Neg,Neg) eye(n-Neg)];
+        Winv    =   [eye(Neg) -S; zeros(n-Neg,Neg) eye(n-Neg)];
+
+        % The above can be used to obtain the transformation T (labelled T1 here) in
+        % Zhou 1999, Theorem 1.
+        T1      = Winv*US';
+        T1inv   = US*W;
+
+        % To get parts of B corresponding to transformed stable and unstable system:
+        BB=T1*B;
+        B1=BB(1:Neg,1:p1);
+        B2=BB(Neg+1:n,1:p1);
+
+        % Gd=[A11 0; 0 A22] where A11 is stable and A22 is unstable
+        Gd=T1*A*T1inv;
+
+        % As and B1 form stable part, Au and Bu form unstable part
+        As = Gd(1:Neg,1:Neg);
+        Au = Gd(Neg+1:n,Neg+1:n);
+
+        % P1 and P2 are controllability gramians of (As,Bs) and (-Au,Bu)
+        % - Zhou (1999) p187
+        P1 = lyapchol(As,B1)'*lyapchol(As,B1);
+        P2 = lyapchol(-Au,B2)'*lyapchol(-Au,B2);
+
+        % P is controllability Gramian of the system, the 'larger' P the
+        % smaller the required control energy
+        % - Zhou (1999) p187 and p195  
+        P = T1inv*[P1 zeros(Neg,n-Neg); zeros(n-Neg,Neg) P2]*T1inv';
+        Tr=T1;
+        """
+
+        if type == 'c' or type == 'o':
+            # Compute Gramian by the Slycot routine sb03md
+            # make sure Slycot is installed
+            if sb03md is None:
+                raise ControlSlycot("can't find slycot module 'sb03md'")
+            if type == 'c':
+                tra = 'T'
+                C = -sys.B @ sys.B.T
+            elif type == 'o':
+                tra = 'N'
+                C = -sys.C.T @ sys.C
+            n = sys.nstates
+            U = np.zeros((n, n))
+            A = np.array(sys.A)         # convert to NumPy array for slycot
+            X, scale, sep, ferr, w = sb03md(
+                n, C, A, U, dico, job='X', fact='N', trana=tra)
+            gram = X
+            return _ssmatrix(gram)
+
+        elif type == 'cf' or type == 'of':
+            # Compute cholesky factored gramian from slycot routine sb03od
+            if sb03od is None:
+                raise ControlSlycot("can't find slycot module 'sb03od'")
+            tra = 'N'
+            n = sys.nstates
+            Q = np.zeros((n, n))
+            A = np.array(sys.A)         # convert to NumPy array for slycot
+            if type == 'cf':
+                m = sys.B.shape[1]
+                B = np.zeros_like(A)
+                B[0:m, 0:n] = sys.B.transpose()
+                X, scale, w = sb03od(
+                    n, m, A.transpose(), Q, B, dico, fact='N', trans=tra)
+            elif type == 'of':
+                m = sys.C.shape[0]
+                C = np.zeros_like(A)
+                C[0:n, 0:m] = sys.C.transpose()
+                X, scale, w = sb03od(
+                    n, m, A, Q, C.transpose(), dico, fact='N', trans=tra)
+            gram = X
+            return _ssmatrix(gram)
+
+    return _ssmatrix(gram)

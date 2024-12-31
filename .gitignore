@@ -20,6 +20,7 @@ examples/.ipynb_checkpoints/
 .project
 Untitled*.ipynb
 *.idea/
+.DS_STORE
 
 # Files created by or for emacs (RMM, 29 Dec 2017)
 *~
